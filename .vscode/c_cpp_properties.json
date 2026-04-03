@@ -1,0 +1,34 @@
+{
+    "env": {
+        "PROJ_DIR": "${workspaceFolder}"
+    },
+    "configurations": [
+        {
+            "name": "STM32F103RCT6",
+            "intelliSenseMode": "gcc-x64",
+            "includePath": [
+                "${PROJ_DIR}/Core/Inc",
+                "${PROJ_DIR}/Drivers/STM32F1xx_HAL_Driver/Inc",
+                "${PROJ_DIR}/Drivers/CMSIS/Device/ST/STM32F1xx/Include",
+                "${PROJ_DIR}/Drivers/CMSIS/Include",
+                "${PROJ_DIR}/App"
+            ],
+            "defines": [
+                "USE_HAL_DRIVER",
+                "STM32F103xE"
+            ],
+            "cStandard": "c99",
+            "cppStandard": "c++17",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}"
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            },
+            "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ],
+    "version": 4
+}
