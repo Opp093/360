@@ -49,28 +49,6 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 __attribute__((used)) uint64_t i = 0x1122334455667788;
-
-// --- 新增：上位机通信协议状态机定义 ---
-typedef enum {
-    STATE_WAIT_HEAD1 = 0, // 等待帧头 0xAA
-    STATE_WAIT_HEAD2,     // 等待帧头 0x55
-    STATE_WAIT_CMD,       // 等待命令字
-    STATE_WAIT_LEN,       // 等待数据长度
-    STATE_WAIT_DATA,      // 接收有效数据
-    STATE_WAIT_CS,        // 等待校验和
-    STATE_WAIT_TAIL       // 等待帧尾
-} UART_RX_StateTypeDef;
-
-// --- 修改：增加 volatile 防止被编译器“暗杀” ---
-volatile uint8_t rx_byte;                 
-volatile UART_RX_StateTypeDef rx_state = STATE_WAIT_HEAD1; 
-volatile uint8_t rx_cmd = 0;              
-volatile uint8_t rx_len = 0;              
-volatile uint8_t rx_data[16];             
-volatile uint8_t rx_data_cnt = 0;         
-volatile uint8_t rx_checksum = 0;         
-volatile uint8_t frame_ready_flag = 0;    
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -140,9 +118,6 @@ int main(void)
   // HAL_GPIO_WritePin(BL_PWM_GPIO_Port, BL_PWM_Pin, GPIO_PIN_SET);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 
-  // --- 新增：启动串口接收中断（每次接收1字节） ---
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
-
   max96755_video_RMW_config(s_96755_video_RMW_config_1920_check_board, CONFIG_NUM_755_VIDEO_checkboard);
 //  check_test();                           //调试看寄存器的
 
@@ -152,39 +127,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // --- 新增：终极硬件监听陷阱 (放在 while(1) 的第一行) ---
-    // 检查物理寄存器是否收到了电平变化，或者是否发生了溢出(ORE)
-    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) != RESET || 
-        __HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)  != RESET) 
-    {
-        // 强制读取底层寄存器，清理堆积的废料
-        volatile uint32_t tmpsr = huart1.Instance->SR;
-        volatile uint32_t tmpdr = huart1.Instance->DR;
-        
-        // 向PC发出尖叫：我的硬件引脚确实收到电平了！
-        HAL_UART_Transmit(&huart1, (uint8_t*)"[DEBUG] Physical RX OK!\n", 24, 100);
-    }
-    // ----------------------------------------------------
-    // --- 新增：处理上位机下发的屏幕配置参数 ---
-    if (frame_ready_flag == 1)
-    {
-        frame_ready_flag = 0; 
-        // 0x02 定义为上位机下发的“单次寄存器透传”指令，长度固定为4字节
-        if (rx_cmd == 0x02 && rx_len == 4)
-        {
-            // --- 绝杀测试：只要串口校验通过，立刻回复PC！不管后面IIC死活 ---
-            HAL_UART_Transmit(&huart1, (uint8_t*)"CMD_OK\n", 7, 100);
-
-            max_96755_register_RMW_CFG_TYPE config_item;
-            config_item.Address = (rx_data[0] << 8) | rx_data[1]; 
-            config_item.mask = rx_data[2];                        
-            config_item.DATA = rx_data[3];                        
-
-            // 底层IIC发送
-            max96755_video_RMW_config(&config_item, 1);
-        }
-    }
-
     static uint8_t state_flag = 0;//芯片在线不在线
     static uint32_t c_time = 0;
     if(max96752_check_chip()) {
@@ -528,98 +470,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
-
 /* USER CODE BEGIN 4 */
-
-// --- 新增：UART 硬件错误急救包（防锁死核心） ---
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1)
-    {
-        // 1. 读取 SR 和 DR 寄存器，这是底层清除 ORE(溢出)、FE(帧错) 的强制手段
-        volatile uint32_t tmp = huart->Instance->SR;
-        tmp = huart->Instance->DR;
-        (void)tmp; // 防止编译器报 warning
-        
-        // 2. 强行复位 HAL 库的接收状态机
-        huart->RxState = HAL_UART_STATE_READY;
-        huart->ErrorCode = HAL_UART_ERROR_NONE;
-        
-        // 3. 重新开启中断，满血复活
-        HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
-    }
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1)
-    {
-        // 1. 状态机流转逻辑
-        switch (rx_state)
-        {
-            case STATE_WAIT_HEAD1:
-                if (rx_byte == 0xAA) {
-                    rx_state = STATE_WAIT_HEAD2;
-                    rx_checksum = 0xAA; // 开始累加校验和
-                }
-                break;
-
-            case STATE_WAIT_HEAD2:
-                if (rx_byte == 0x55) {
-                    rx_state = STATE_WAIT_CMD;
-                    rx_checksum += rx_byte;
-                } else {
-                    rx_state = STATE_WAIT_HEAD1; // 格式错误，打回原形
-                }
-                break;
-
-            case STATE_WAIT_CMD:
-                rx_cmd = rx_byte;
-                rx_checksum += rx_byte;
-                rx_state = STATE_WAIT_LEN;
-                break;
-
-            case STATE_WAIT_LEN:
-                rx_len = rx_byte;
-                rx_checksum += rx_byte;
-                rx_data_cnt = 0;
-                if (rx_len > 0 && rx_len <= 16) {
-                    rx_state = STATE_WAIT_DATA;
-                } else if (rx_len == 0) {
-                    rx_state = STATE_WAIT_CS; // 无数据，直接校验
-                } else {
-                    rx_state = STATE_WAIT_HEAD1; // 长度超限，复位
-                }
-                break;
-
-            case STATE_WAIT_DATA:
-                rx_data[rx_data_cnt++] = rx_byte;
-                rx_checksum += rx_byte;
-                if (rx_data_cnt >= rx_len) {
-                    rx_state = STATE_WAIT_CS; // 数据收完，准备校验
-                }
-                break;
-
-            case STATE_WAIT_CS:
-                if (rx_byte == rx_checksum) {
-                    rx_state = STATE_WAIT_TAIL; // 校验通过！
-                } else {
-                    rx_state = STATE_WAIT_HEAD1; // 校验失败，丢弃脏数据
-                }
-                break;
-
-            case STATE_WAIT_TAIL:
-                if (rx_byte == 0x0D || rx_byte == 0x0A) {
-                    frame_ready_flag = 1; // 斩获完整一帧，立起Flag通知主循环
-                }
-                rx_state = STATE_WAIT_HEAD1; // 无论成败，为下一帧做准备
-                break;
-        }
-
-        // 2. 再次开启中断，准备接收下一个字节
-        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
-    }
-}
 
 /* USER CODE END 4 */
 
