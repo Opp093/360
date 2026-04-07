@@ -61,15 +61,15 @@ typedef enum {
     STATE_WAIT_TAIL       // 等待帧尾
 } UART_RX_StateTypeDef;
 
-// --- 新增：接收缓冲区与控制标志 ---
-uint8_t rx_byte;                 // 每次进中断接收的1个字节
-UART_RX_StateTypeDef rx_state = STATE_WAIT_HEAD1; // 初始状态
-uint8_t rx_cmd = 0;              // 暂存命令字
-uint8_t rx_len = 0;              // 暂存数据长度
-uint8_t rx_data[16];             // 有效数据缓冲区
-uint8_t rx_data_cnt = 0;         // 已接收数据计数
-uint8_t rx_checksum = 0;         // 累加计算的校验和
-uint8_t frame_ready_flag = 0;    // 完整数据帧接收成功标志
+// --- 修改：增加 volatile 防止被编译器“暗杀” ---
+volatile uint8_t rx_byte;                 
+volatile UART_RX_StateTypeDef rx_state = STATE_WAIT_HEAD1; 
+volatile uint8_t rx_cmd = 0;              
+volatile uint8_t rx_len = 0;              
+volatile uint8_t rx_data[16];             
+volatile uint8_t rx_data_cnt = 0;         
+volatile uint8_t rx_checksum = 0;         
+volatile uint8_t frame_ready_flag = 0;    
 
 /* USER CODE END PV */
 
@@ -152,6 +152,19 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // --- 新增：终极硬件监听陷阱 (放在 while(1) 的第一行) ---
+    // 检查物理寄存器是否收到了电平变化，或者是否发生了溢出(ORE)
+    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) != RESET || 
+        __HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)  != RESET) 
+    {
+        // 强制读取底层寄存器，清理堆积的废料
+        volatile uint32_t tmpsr = huart1.Instance->SR;
+        volatile uint32_t tmpdr = huart1.Instance->DR;
+        
+        // 向PC发出尖叫：我的硬件引脚确实收到电平了！
+        HAL_UART_Transmit(&huart1, (uint8_t*)"[DEBUG] Physical RX OK!\n", 24, 100);
+    }
+    // ----------------------------------------------------
     // --- 新增：处理上位机下发的屏幕配置参数 ---
     if (frame_ready_flag == 1)
     {
@@ -159,12 +172,15 @@ int main(void)
         // 0x02 定义为上位机下发的“单次寄存器透传”指令，长度固定为4字节
         if (rx_cmd == 0x02 && rx_len == 4)
         {
-            max_96755_register_RMW_CFG_TYPE config_item;
-            config_item.Address = (rx_data[0] << 8) | rx_data[1]; // 拼接16位寄存器地址
-            config_item.mask = rx_data[2];                        // 掩码
-            config_item.DATA = rx_data[3];                        // 写入的数值
+            // --- 绝杀测试：只要串口校验通过，立刻回复PC！不管后面IIC死活 ---
+            HAL_UART_Transmit(&huart1, (uint8_t*)"CMD_OK\n", 7, 100);
 
-            // 直接调用你原本的底层函数，传入单个结构体，数量设为1
+            max_96755_register_RMW_CFG_TYPE config_item;
+            config_item.Address = (rx_data[0] << 8) | rx_data[1]; 
+            config_item.mask = rx_data[2];                        
+            config_item.DATA = rx_data[3];                        
+
+            // 底层IIC发送
             max96755_video_RMW_config(&config_item, 1);
         }
     }
@@ -514,6 +530,26 @@ static void MX_GPIO_Init(void)
 
 
 /* USER CODE BEGIN 4 */
+
+// --- 新增：UART 硬件错误急救包（防锁死核心） ---
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        // 1. 读取 SR 和 DR 寄存器，这是底层清除 ORE(溢出)、FE(帧错) 的强制手段
+        volatile uint32_t tmp = huart->Instance->SR;
+        tmp = huart->Instance->DR;
+        (void)tmp; // 防止编译器报 warning
+        
+        // 2. 强行复位 HAL 库的接收状态机
+        huart->RxState = HAL_UART_STATE_READY;
+        huart->ErrorCode = HAL_UART_ERROR_NONE;
+        
+        // 3. 重新开启中断，满血复活
+        HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+    }
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)

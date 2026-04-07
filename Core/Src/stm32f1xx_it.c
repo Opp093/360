@@ -22,6 +22,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+extern UART_HandleTypeDef huart1; // 声明外部串口句柄
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -199,5 +200,18 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+// --- 新增：USART1 硬件中断服务函数 ---
+void USART1_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART1_IRQn 0 */
 
+  /* USER CODE END USART1_IRQn 0 */
+  
+  // 这行代码会把硬件中断信号，导向 HAL 库的处理逻辑，最终触发我们写的 Callback
+  HAL_UART_IRQHandler(&huart1);
+  
+  /* USER CODE BEGIN USART1_IRQn 1 */
+
+  /* USER CODE END USART1_IRQn 1 */
+}
 /* USER CODE END 1 */
