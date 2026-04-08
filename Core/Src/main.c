@@ -49,6 +49,23 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 __attribute__((used)) uint64_t i = 0x1122334455667788;
+
+// --- 新增：极简通讯指令标志位 ---
+volatile uint8_t rx_cmd_ready = 0; 
+volatile uint8_t rx_cmd_val = 0;
+volatile uint8_t rx_screen_res = 0;
+volatile uint8_t rx_lvds_mode = 0;
+volatile uint8_t rx_screen_pattern = 0;
+volatile uint16_t rx_timing_ha = 0;
+volatile uint16_t rx_timing_va = 0;
+volatile uint16_t rx_timing_fps_x10 = 0;
+volatile uint32_t rx_timing_pclk_hz = 0;
+volatile uint16_t rx_timing_hbp = 0;
+volatile uint16_t rx_timing_hfp = 0;
+volatile uint16_t rx_timing_vbp = 0;
+volatile uint16_t rx_timing_vfp = 0;
+volatile uint8_t rx_timing_lvds = 0;
+volatile uint8_t rx_timing_pattern = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,18 +132,91 @@ int main(void)
   sys_init();
 
   EN_BL();
-  // HAL_GPIO_WritePin(BL_PWM_GPIO_Port, BL_PWM_Pin, GPIO_PIN_SET);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 
-  max96755_video_RMW_config(s_96755_video_RMW_config_1920_check_board, CONFIG_NUM_755_VIDEO_checkboard);
-//  check_test();                           //调试看寄存器的
+  // 1. 默认上电：1920x1080 + 双路 LVDS + 棋盘格
+  max96755_apply_screen_preset(0, 0, 1);
 
+  // 2. 强行打开 USART1 的总中断和寄存器接收（极其重要！）
+  HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+  __HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // --- 新增：响应上位机画面切换指令 ---
+    if (rx_cmd_ready == 1)
+    {
+        rx_cmd_ready = 0; 
+        if (rx_cmd_val == 0x01) {
+            max96755_apply_screen_preset(0, 0, 0);
+            HAL_UART_Transmit(&huart1, (uint8_t*)"[MCU] Switch to ColorBar OK (1920/dual)\n", 40, 100);
+        }
+        else if (rx_cmd_val == 0x02) {
+            max96755_apply_screen_preset(0, 0, 1);
+            HAL_UART_Transmit(&huart1, (uint8_t*)"[MCU] Switch to CheckBoard OK (1920/dual)\n", 42, 100);
+        }
+        else if (rx_cmd_val == 0x10) {
+            uint8_t r = rx_screen_res & 1;
+            uint8_t l = rx_lvds_mode & 1;
+            uint8_t p = rx_screen_pattern & 1;
+            max96755_apply_screen_preset(r, l, p);
+            {
+              static const char ack[] = "[MCU] Screen preset applied OK\n";
+              HAL_UART_Transmit(&huart1, (uint8_t *)ack, sizeof(ack) - 1U, 100);
+            }
+        }
+        else if (rx_cmd_val == 0x11) {
+            max96755_apply_user_timing(
+                rx_timing_ha,
+                rx_timing_va,
+                rx_timing_fps_x10,
+                (uint8_t)(rx_timing_lvds & 1U),
+                (uint8_t)(rx_timing_pattern & 1U));
+            {
+              static const char ack[] = "[MCU] Custom timing (MAX96755) OK\n";
+              HAL_UART_Transmit(&huart1, (uint8_t *)ack, sizeof(ack) - 1U, 100);
+            }
+        }
+        else if (rx_cmd_val == 0x12) {
+            max96755_apply_user_timing_pclk(
+                rx_timing_ha,
+                rx_timing_va,
+                rx_timing_fps_x10,
+                rx_timing_pclk_hz,
+                (uint8_t)(rx_timing_lvds & 1U),
+                (uint8_t)(rx_timing_pattern & 1U));
+            {
+              static const char ack[] = "[MCU] Custom timing+PCLK (MAX96755) OK\n";
+              HAL_UART_Transmit(&huart1, (uint8_t *)ack, sizeof(ack) - 1U, 100);
+            }
+        }
+        else if (rx_cmd_val == 0x13) {
+            max96755_apply_user_timing_full(
+                rx_timing_ha, rx_timing_va, rx_timing_fps_x10, rx_timing_pclk_hz,
+                rx_timing_hbp, rx_timing_hfp, rx_timing_vbp, rx_timing_vfp,
+                (uint8_t)(rx_timing_lvds & 1U), (uint8_t)(rx_timing_pattern & 1U));
+            {
+              static const char ack[] = "[MCU] Custom timing+PCLK+Porch OK\n";
+              HAL_UART_Transmit(&huart1, (uint8_t *)ack, sizeof(ack) - 1U, 100);
+            }
+        }
+        // =======================================================
+        // --- 终极验货：无视视频时序，直接掐断/开启背光电源！ ---
+        else if (rx_cmd_val == 0x03) {
+            DISEN_BL(); // 调用你原本的关背光函数
+            HAL_UART_Transmit(&huart1, (uint8_t*)"[MCU] Backlight OFF OK\n", 23, 100);
+        }
+        else if (rx_cmd_val == 0x04) {
+            EN_BL();    // 调用你原本的开背光函数
+            HAL_UART_Transmit(&huart1, (uint8_t*)"[MCU] Backlight ON OK\n", 22, 100);
+        }
+        // =======================================================
+    }
+    
     static uint8_t state_flag = 0;//芯片在线不在线
     static uint32_t c_time = 0;
     if(max96752_check_chip()) {
@@ -471,7 +561,231 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+// --- 终极绝杀：纯底层寄存器接收 ---
+void Custom_UART_RX_Handler(void)
+{
+    if ((USART1->SR & (USART_SR_ORE | USART_SR_NE | USART_SR_FE)) != RESET) {
+        volatile uint32_t tmp = USART1->SR;
+        tmp = USART1->DR;
+        (void)tmp;
+    }
 
+    if ((USART1->SR & USART_SR_RXNE) != RESET) {
+        uint8_t data = USART1->DR; 
+        
+        // 【硬件回声镜】：收到什么瞬间弹回给电脑！
+        while((USART1->SR & (1<<7)) == 0); 
+        USART1->DR = data;                 
+        
+        static uint8_t state = 0;
+        static uint8_t cmd = 0;
+        static uint8_t timing_blob8[8];
+        static uint8_t timing_blob12[12];
+        static uint8_t timing_blob20[20];
+
+        switch (state) {
+        case 0:
+            if (data == 0xAA) {
+                state = 1;
+            }
+            break;
+        case 1:
+            cmd = data;
+            if (cmd == 0x10) {
+                state = 10;
+            } else if (cmd == 0x11) {
+                state = 20;
+            } else if (cmd == 0x12) {
+                state = 40;
+            } else if (cmd == 0x13) {
+                state = 60;
+            } else if (cmd >= 0x01 && cmd <= 0x04) {
+                state = 2;
+            } else {
+                state = 0;
+            }
+            break;
+        case 2:
+            if (data == 0x55) {
+                rx_cmd_val = cmd;
+                rx_cmd_ready = 1;
+            }
+            state = 0;
+            break;
+        case 10:
+            rx_screen_res = data;
+            state = 11;
+            break;
+        case 11:
+            rx_lvds_mode = data;
+            state = 12;
+            break;
+        case 12:
+            rx_screen_pattern = data;
+            state = 13;
+            break;
+        case 13:
+            if (data == 0x55) {
+                rx_cmd_val = 0x10;
+                rx_cmd_ready = 1;
+            }
+            state = 0;
+            break;
+        case 20:
+            timing_blob8[0] = data;
+            state = 21;
+            break;
+        case 21:
+            timing_blob8[1] = data;
+            state = 22;
+            break;
+        case 22:
+            timing_blob8[2] = data;
+            state = 23;
+            break;
+        case 23:
+            timing_blob8[3] = data;
+            state = 24;
+            break;
+        case 24:
+            timing_blob8[4] = data;
+            state = 25;
+            break;
+        case 25:
+            timing_blob8[5] = data;
+            state = 26;
+            break;
+        case 26:
+            timing_blob8[6] = data;
+            state = 27;
+            break;
+        case 27:
+            timing_blob8[7] = data;
+            state = 28;
+            break;
+        case 28:
+            if (data == 0x55) {
+                rx_timing_ha = (uint16_t)timing_blob8[0] | ((uint16_t)timing_blob8[1] << 8);
+                rx_timing_va = (uint16_t)timing_blob8[2] | ((uint16_t)timing_blob8[3] << 8);
+                rx_timing_fps_x10 = (uint16_t)timing_blob8[4] | ((uint16_t)timing_blob8[5] << 8);
+                rx_timing_pclk_hz = 0;
+                rx_timing_lvds = timing_blob8[6];
+                rx_timing_pattern = timing_blob8[7];
+                rx_cmd_val = 0x11;
+                rx_cmd_ready = 1;
+            }
+            state = 0;
+            break;
+        case 40:
+            timing_blob12[0] = data;
+            state = 41;
+            break;
+        case 41:
+            timing_blob12[1] = data;
+            state = 42;
+            break;
+        case 42:
+            timing_blob12[2] = data;
+            state = 43;
+            break;
+        case 43:
+            timing_blob12[3] = data;
+            state = 44;
+            break;
+        case 44:
+            timing_blob12[4] = data;
+            state = 45;
+            break;
+        case 45:
+            timing_blob12[5] = data;
+            state = 46;
+            break;
+        case 46:
+            timing_blob12[6] = data;
+            state = 47;
+            break;
+        case 47:
+            timing_blob12[7] = data;
+            state = 48;
+            break;
+        case 48:
+            timing_blob12[8] = data;
+            state = 49;
+            break;
+        case 49:
+            timing_blob12[9] = data;
+            state = 50;
+            break;
+        case 50:
+            timing_blob12[10] = data;
+            state = 51;
+            break;
+        case 51:
+            timing_blob12[11] = data;
+            state = 52;
+            break;
+        case 52:
+            if (data == 0x55) {
+                rx_timing_ha = (uint16_t)timing_blob12[0] | ((uint16_t)timing_blob12[1] << 8);
+                rx_timing_va = (uint16_t)timing_blob12[2] | ((uint16_t)timing_blob12[3] << 8);
+                rx_timing_fps_x10 = (uint16_t)timing_blob12[4] | ((uint16_t)timing_blob12[5] << 8);
+                rx_timing_pclk_hz = (uint32_t)timing_blob12[6]
+                                  | ((uint32_t)timing_blob12[7] << 8)
+                                  | ((uint32_t)timing_blob12[8] << 16)
+                                  | ((uint32_t)timing_blob12[9] << 24);
+                rx_timing_lvds = timing_blob12[10];
+                rx_timing_pattern = timing_blob12[11];
+                rx_cmd_val = 0x12;
+                rx_cmd_ready = 1;
+            }
+            state = 0;
+            break;
+        case 60: timing_blob20[0] = data; state = 61; break;
+        case 61: timing_blob20[1] = data; state = 62; break;
+        case 62: timing_blob20[2] = data; state = 63; break;
+        case 63: timing_blob20[3] = data; state = 64; break;
+        case 64: timing_blob20[4] = data; state = 65; break;
+        case 65: timing_blob20[5] = data; state = 66; break;
+        case 66: timing_blob20[6] = data; state = 67; break;
+        case 67: timing_blob20[7] = data; state = 68; break;
+        case 68: timing_blob20[8] = data; state = 69; break;
+        case 69: timing_blob20[9] = data; state = 70; break;
+        case 70: timing_blob20[10] = data; state = 71; break;
+        case 71: timing_blob20[11] = data; state = 72; break;
+        case 72: timing_blob20[12] = data; state = 73; break;
+        case 73: timing_blob20[13] = data; state = 74; break;
+        case 74: timing_blob20[14] = data; state = 75; break;
+        case 75: timing_blob20[15] = data; state = 76; break;
+        case 76: timing_blob20[16] = data; state = 77; break;
+        case 77: timing_blob20[17] = data; state = 78; break;
+        case 78: timing_blob20[18] = data; state = 79; break;
+        case 79: timing_blob20[19] = data; state = 80; break;
+        case 80:
+            if (data == 0x55) {
+                rx_timing_ha = (uint16_t)timing_blob20[0] | ((uint16_t)timing_blob20[1] << 8);
+                rx_timing_va = (uint16_t)timing_blob20[2] | ((uint16_t)timing_blob20[3] << 8);
+                rx_timing_fps_x10 = (uint16_t)timing_blob20[4] | ((uint16_t)timing_blob20[5] << 8);
+                rx_timing_pclk_hz = (uint32_t)timing_blob20[6]
+                                  | ((uint32_t)timing_blob20[7] << 8)
+                                  | ((uint32_t)timing_blob20[8] << 16)
+                                  | ((uint32_t)timing_blob20[9] << 24);
+                rx_timing_hbp = (uint16_t)timing_blob20[10] | ((uint16_t)timing_blob20[11] << 8);
+                rx_timing_hfp = (uint16_t)timing_blob20[12] | ((uint16_t)timing_blob20[13] << 8);
+                rx_timing_vbp = (uint16_t)timing_blob20[14] | ((uint16_t)timing_blob20[15] << 8);
+                rx_timing_vfp = (uint16_t)timing_blob20[16] | ((uint16_t)timing_blob20[17] << 8);
+                rx_timing_lvds = timing_blob20[18];
+                rx_timing_pattern = timing_blob20[19];
+                rx_cmd_val = 0x13;
+                rx_cmd_ready = 1;
+            }
+            state = 0;
+            break;
+        default:
+            state = 0;
+            break;
+        }
+    }
+}
 /* USER CODE END 4 */
 
 /**

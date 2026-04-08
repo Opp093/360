@@ -89,10 +89,10 @@ void check_test() {
 
 while(1) {
     HAL_Delay(2000);
-    max96755_video_RMW_config(s_96755_video_RMW_config_1920_check_board, CONFIG_NUM_755_VIDEO_checkboard);
+    max96755_video_RMW_config((max_96755_register_RMW_CFG_TYPE *)s_96755_video_RMW_config_1920_check_board, CONFIG_NUM_755_VIDEO_checkboard);
     // DISEN_BL();
     HAL_Delay(2000);
-	max96755_video_RMW_config(s_96755_video_RMW_config_1920_color_bar, CONFIG_NUM_755_VIDEO_color_bar);
+	max96755_video_RMW_config((max_96755_register_RMW_CFG_TYPE *)s_96755_video_RMW_config_1920_color_bar, CONFIG_NUM_755_VIDEO_color_bar);
     // EN_BL();
 		
     // if(HAL_GPIO_ReadPin(GPIOC,BL_EN_Pin) == GPIO_PIN_SET){

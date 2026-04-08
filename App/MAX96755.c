@@ -2,6 +2,7 @@
 
 #include "stm32f1xx_hal.h"
 #include "main.h"
+#include <string.h>
 
 extern I2C_HandleTypeDef hi2c1;
 
@@ -373,6 +374,275 @@ void max96755_video_RMW_config(max_96755_register_RMW_CFG_TYPE cfg[], uint8_t cf
 			max96755_send((max_96752_register_data_type*)&frame);
 		}
 	}
+}
+
+void max96755_apply_screen_preset(uint8_t res, uint8_t lvds, uint8_t pattern) {
+	const max_96755_register_RMW_CFG_TYPE *tbl = NULL;
+	uint8_t n = 0;
+
+	if (res == 0) {
+		if (pattern == 0) {
+			tbl = s_96755_video_RMW_config_1920_color_bar;
+			n = CONFIG_NUM_755_VIDEO_color_bar;
+		} else {
+			tbl = s_96755_video_RMW_config_1920_check_board;
+			n = CONFIG_NUM_755_VIDEO_checkboard;
+		}
+	} else {
+		if (pattern == 0) {
+			tbl = s_96755_video_RMW_config_880_color_bar;
+			n = CONFIG_NUM_755_VIDEO_color_bar;
+		} else {
+			tbl = s_96755_video_RMW_config_880_check_board;
+			n = CONFIG_NUM_755_VIDEO_checkboard;
+		}
+	}
+
+	(void)lvds;
+	if (tbl != NULL && n > 0) {
+		max96755_video_RMW_config((max_96755_register_RMW_CFG_TYPE *)tbl, n);
+	}
+}
+
+/* 默认与板级 CDCE913 约 98MHz 像素时钟一致 */
+#define MAX96755_PCLK_DEFAULT_HZ 98000000UL
+
+static void timing_patch_byte(max_96755_register_RMW_CFG_TYPE *cfg, uint8_t n, uint16_t addr, uint8_t d)
+{
+	for (uint8_t i = 0; i < n; i++) {
+		if (cfg[i].Address == addr && cfg[i].mask == 0xFF) {
+			cfg[i].DATA = d;
+			return;
+		}
+	}
+}
+
+static void timing_patch_u16(max_96755_register_RMW_CFG_TYPE *cfg, uint8_t n, uint16_t addr, uint16_t v)
+{
+	timing_patch_byte(cfg, n, addr, (uint8_t)(v >> 8));
+	timing_patch_byte(cfg, n, (uint16_t)(addr + 1U), (uint8_t)(v & 0xFF));
+}
+
+static void timing_patch_u24(max_96755_register_RMW_CFG_TYPE *cfg, uint8_t n, uint16_t addr, uint32_t v)
+{
+	if (v > 0xFFFFFFUL) {
+		v = 0xFFFFFFUL;
+	}
+	timing_patch_byte(cfg, n, addr, (uint8_t)((v >> 16) & 0xFF));
+	timing_patch_byte(cfg, n, (uint16_t)(addr + 1U), (uint8_t)((v >> 8) & 0xFF));
+	timing_patch_byte(cfg, n, (uint16_t)(addr + 2U), (uint8_t)(v & 0xFF));
+}
+
+static void max96755_apply_user_timing_core(uint16_t h_active, uint16_t v_active, uint16_t refresh_fps_x10,
+					    uint32_t pclk_hz, uint8_t lvds, uint8_t pattern)
+{
+	uint8_t pat = (uint8_t)(pattern & 1U);
+	uint8_t ncfg = pat ? CONFIG_NUM_755_VIDEO_checkboard : CONFIG_NUM_755_VIDEO_color_bar;
+	static max_96755_register_RMW_CFG_TYPE work[CONFIG_NUM_755_VIDEO_checkboard];
+
+	(void)lvds;
+
+	if (h_active < 320U || h_active > 4095U || v_active < 200U || v_active > 2160U) {
+		return;
+	}
+	if (refresh_fps_x10 < 300U || refresh_fps_x10 > 1200U) {
+		return;
+	}
+	if (pclk_hz < 1000000UL || pclk_hz > 200000000UL) {
+		return;
+	}
+
+	{
+		const max_96755_register_RMW_CFG_TYPE *src =
+		    pat ? s_96755_video_RMW_config_880_check_board : s_96755_video_RMW_config_880_color_bar;
+		memcpy(work, src, (size_t)ncfg * sizeof(work[0]));
+	}
+
+	{
+		uint32_t frame_pix = (pclk_hz * 10UL) / (uint32_t)refresh_fps_x10;
+		uint32_t v_tot = (uint32_t)v_active + (uint32_t)v_active / 8U + 30U;
+		uint32_t h_tot;
+		uint32_t h_blank;
+
+		if (v_tot < (uint32_t)v_active + 20U) {
+			v_tot = (uint32_t)v_active + 20U;
+		}
+		h_tot = frame_pix / v_tot;
+		if (h_tot < (uint32_t)h_active + 48U) {
+			h_tot = (uint32_t)h_active + 48U;
+			v_tot = frame_pix / h_tot;
+			if (v_tot < (uint32_t)v_active + 20U) {
+				v_tot = (uint32_t)v_active + 20U;
+			}
+			h_tot = frame_pix / v_tot;
+		}
+		h_blank = h_tot - (uint32_t)h_active;
+		if (h_blank < 24U) {
+			h_tot += (24U - h_blank);
+			h_blank = h_tot - (uint32_t)h_active;
+			v_tot = frame_pix / h_tot;
+		}
+
+		{
+			uint16_t hs_h = (uint16_t)((h_tot * 12UL) / 880UL);
+			if (hs_h < 8U) {
+				hs_h = 8U;
+			}
+			if ((uint32_t)hs_h + 8UL >= h_tot) {
+				hs_h = (uint16_t)(h_tot / 2U);
+			}
+			{
+				uint16_t hs_l = (uint16_t)(h_tot - (uint32_t)hs_h);
+				timing_patch_u16(work, ncfg, 0x01D6, hs_h);
+				timing_patch_u16(work, ncfg, 0x01D8, hs_l);
+			}
+		}
+
+		timing_patch_u16(work, ncfg, 0x01DF, h_active);
+		timing_patch_u16(work, ncfg, 0x01E1, (uint16_t)h_blank);
+		timing_patch_u16(work, ncfg, 0x01E3, v_active);
+
+		{
+			const uint32_t ref_vs_high = 0x0006E0UL;
+			const uint32_t ref_vs_low = 0x0697D0UL;
+			const uint32_t ref_vs2de = 0x0014B4UL;
+			uint32_t vs_high;
+			uint32_t vs_low;
+			uint32_t vs2de;
+			uint32_t hs_pf;
+
+			vs_high = (uint32_t)(((uint64_t)ref_vs_high * (uint64_t)v_tot * 600ULL)
+					     / ((uint64_t)525 * (uint64_t)refresh_fps_x10));
+			vs_low = (uint32_t)(((uint64_t)ref_vs_low * (uint64_t)v_tot * 600ULL)
+					    / ((uint64_t)525 * (uint64_t)refresh_fps_x10));
+			vs2de = (uint32_t)(((uint64_t)ref_vs2de * (uint64_t)v_tot * (uint64_t)h_active * 600ULL)
+					   / ((uint64_t)525 * (uint64_t)800 * (uint64_t)refresh_fps_x10));
+			hs_pf = (uint32_t)(((uint64_t)493UL * (uint64_t)v_tot * 600ULL)
+					   / ((uint64_t)525 * (uint64_t)refresh_fps_x10));
+
+			timing_patch_u24(work, ncfg, 0x01CD, vs_high);
+			timing_patch_u24(work, ncfg, 0x01D0, vs_low);
+			timing_patch_u24(work, ncfg, 0x01DC, vs2de);
+			timing_patch_u16(work, ncfg, 0x01DA, (uint16_t)(hs_pf > 0xFFFFUL ? 0xFFFFU : hs_pf));
+		}
+	}
+
+	if (pat != 0U) {
+		uint8_t i;
+		for (i = 0; i < ncfg; i++) {
+			if (work[i].Address >= 0x01E7U && work[i].Address <= 0x01EFU && work[i].mask == 0xFF) {
+				uint32_t nv = (uint32_t)(((uint64_t)work[i].DATA * (uint64_t)v_active) / 480ULL);
+				if (nv > 255U) {
+					nv = 255U;
+				}
+				work[i].DATA = (uint8_t)nv;
+			}
+		}
+	}
+
+	max96755_video_RMW_config(work, ncfg);
+}
+
+static void max96755_apply_user_timing_core_full(uint16_t h_active, uint16_t v_active, uint16_t refresh_fps_x10,
+						 uint32_t pclk_hz, uint16_t hbp, uint16_t hfp, uint16_t vbp,
+						 uint16_t vfp, uint8_t lvds, uint8_t pattern)
+{
+	uint8_t pat = (uint8_t)(pattern & 1U);
+	uint8_t ncfg = pat ? CONFIG_NUM_755_VIDEO_checkboard : CONFIG_NUM_755_VIDEO_color_bar;
+	static max_96755_register_RMW_CFG_TYPE work[CONFIG_NUM_755_VIDEO_checkboard];
+
+	(void)lvds;
+	if (h_active < 320U || h_active > 4095U || v_active < 200U || v_active > 2160U) {
+		return;
+	}
+	if (refresh_fps_x10 < 300U || refresh_fps_x10 > 1200U) {
+		return;
+	}
+	if (pclk_hz < 1000000UL || pclk_hz > 200000000UL) {
+		return;
+	}
+	if (hbp > 4095U || hfp > 4095U || vbp > 4095U || vfp > 4095U) {
+		return;
+	}
+
+	{
+		const max_96755_register_RMW_CFG_TYPE *src =
+		    pat ? s_96755_video_RMW_config_880_check_board : s_96755_video_RMW_config_880_color_bar;
+		memcpy(work, src, (size_t)ncfg * sizeof(work[0]));
+	}
+
+	{
+		uint32_t frame_pix = (pclk_hz * 10UL) / (uint32_t)refresh_fps_x10;
+		uint32_t h_blank = (uint32_t)hbp + (uint32_t)hfp;
+		uint32_t h_tot = (uint32_t)h_active + h_blank;
+		uint32_t v_blank = (uint32_t)vbp + (uint32_t)vfp;
+		uint32_t v_tot = (uint32_t)v_active + v_blank + 1U;
+		uint32_t hs_h = h_tot / 32U;
+		uint32_t hs_l;
+		uint32_t hs_pf;
+		uint32_t vs_high;
+		uint32_t vs_low;
+		uint32_t vs2de;
+
+		if (h_blank < 8U) h_blank = 8U;
+		h_tot = (uint32_t)h_active + h_blank;
+		if (v_blank < 2U) v_blank = 2U;
+		v_tot = (uint32_t)v_active + v_blank + 1U;
+		if (h_tot * v_tot > frame_pix) {
+			v_tot = frame_pix / h_tot;
+			if (v_tot < (uint32_t)v_active + 3U) {
+				v_tot = (uint32_t)v_active + 3U;
+			}
+		}
+
+		if (hs_h < 8U) hs_h = 8U;
+		if (hs_h >= h_tot) hs_h = h_tot / 2U;
+		hs_l = h_tot - hs_h;
+		hs_pf = (v_tot > 0xFFFFUL) ? 0xFFFFUL : v_tot;
+		vs_high = hs_h * (vbp > 0 ? vbp : 1U);
+		vs_low = hs_l * (v_tot > (vbp > 0 ? vbp : 1U) ? (v_tot - (vbp > 0 ? vbp : 1U)) : 1U);
+		vs2de = (uint32_t)vbp * h_tot + hfp;
+
+		timing_patch_u16(work, ncfg, 0x01D6, (uint16_t)hs_h);
+		timing_patch_u16(work, ncfg, 0x01D8, (uint16_t)hs_l);
+		timing_patch_u16(work, ncfg, 0x01DA, (uint16_t)hs_pf);
+		timing_patch_u24(work, ncfg, 0x01CD, vs_high);
+		timing_patch_u24(work, ncfg, 0x01D0, vs_low);
+		timing_patch_u24(work, ncfg, 0x01DC, vs2de);
+		timing_patch_u16(work, ncfg, 0x01DF, h_active);
+		timing_patch_u16(work, ncfg, 0x01E1, (uint16_t)h_blank);
+		timing_patch_u16(work, ncfg, 0x01E3, v_active);
+	}
+
+	if (pat != 0U) {
+		for (uint8_t i = 0; i < ncfg; i++) {
+			if (work[i].Address >= 0x01E7U && work[i].Address <= 0x01EFU && work[i].mask == 0xFF) {
+				uint32_t nv = (uint32_t)(((uint64_t)work[i].DATA * (uint64_t)v_active) / 480ULL);
+				if (nv > 255U) nv = 255U;
+				work[i].DATA = (uint8_t)nv;
+			}
+		}
+	}
+	max96755_video_RMW_config(work, ncfg);
+}
+
+void max96755_apply_user_timing(uint16_t h_active, uint16_t v_active, uint16_t refresh_fps_x10,
+				uint8_t lvds, uint8_t pattern)
+{
+	max96755_apply_user_timing_core(h_active, v_active, refresh_fps_x10, MAX96755_PCLK_DEFAULT_HZ, lvds, pattern);
+}
+
+void max96755_apply_user_timing_pclk(uint16_t h_active, uint16_t v_active, uint16_t refresh_fps_x10,
+				     uint32_t pclk_hz, uint8_t lvds, uint8_t pattern)
+{
+	max96755_apply_user_timing_core(h_active, v_active, refresh_fps_x10, pclk_hz, lvds, pattern);
+}
+
+void max96755_apply_user_timing_full(uint16_t h_active, uint16_t v_active, uint16_t refresh_fps_x10,
+				     uint32_t pclk_hz, uint16_t hbp, uint16_t hfp, uint16_t vbp, uint16_t vfp,
+				     uint8_t lvds, uint8_t pattern)
+{
+	max96755_apply_user_timing_core_full(h_active, v_active, refresh_fps_x10, pclk_hz, hbp, hfp, vbp, vfp, lvds, pattern);
 }
 
 

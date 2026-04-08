@@ -200,4 +200,13 @@ void SysTick_Handler(void)
 
 /* USER CODE BEGIN 1 */
 
+// 声明极速接收函数
+extern void Custom_UART_RX_Handler(void); 
+
+// STM32 硬件中断门铃
+void USART1_IRQHandler(void)
+{
+    Custom_UART_RX_Handler();
+}
+
 /* USER CODE END 1 */
